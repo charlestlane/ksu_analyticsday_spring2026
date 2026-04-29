@@ -1,0 +1,722 @@
+---
+title: "Exploring NCAA Postseason Awards"
+author: "Kyle Bresko, Charles Lane, Kaleb Treangen"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    theme: cosmo
+    code-fold: false
+    code-tools: true
+    embed-resources: true
+---
+
+::: {layout-ncol="2"}
+![](../assets/MB_Horz_3Clr.png){width="200"}
+
+![](../assets/qr_code.png){width="200"}
+:::
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+library(tidyverse)
+library(ggplot2)
+library(plotly)
+library(DT)
+library(leaflet)
+library(qrcode)
+```
+
+# Introduction
+
+In recent years, NCAA athletes have had more freedom to transfer schools to play sports thanks to NIL (Name, Image and Likeness) without any restrictions or repercussions. This change to the landscape of college sports has transformed college athletics and has resulted in team rosters having a large increase in turnover rates. To put this in perspective, there are some reports that show that over 50% of all college athletes who enter the portal may end up not even finding a new school. That is just how many athletes are entering the portal. The only real restriction for all sports is the 'transfer window' which is the only time an athlete can transfer and is currently only open for 15 days. This makes it important for coaches to know which athletes to target before the window opens and closes. While season-ending awards can signal high performance, these recognitions occur after the season. With this in mind, our goal is to model high performers using previous season statistics to be able to forecast awards won by current season players.
+
+# Data
+
+### Data Sources
+
+-   **Boxscores**: gathered using R module ncaahoopR (<https://github.com/lbenz730/ncaahoopR>)
+-   **Award Counts**: gathered from <https://www.sports-reference.com/cbb/awards/>
+
+### Load Data
+
+```{r}
+#| label: load-data
+#| message: FALSE
+schools <- tibble(
+  School = c(
+    "FIU", "Jacksonville St", "LA Tech", "Liberty", "Mid Tennessee",
+    "New Mexico St", "Sam Houston", "UTEP", "W Kentucky",
+    "Kennesaw State", "Delaware", "Missouri State"
+  ),
+  `23-24` = c(
+    TRUE, TRUE, TRUE, TRUE, TRUE,
+    TRUE, TRUE, TRUE, TRUE,
+    FALSE, FALSE, FALSE
+  ),
+  `24-25` = c(
+    TRUE, TRUE, TRUE, TRUE, TRUE,
+    TRUE, TRUE, TRUE, TRUE,
+    TRUE, FALSE, FALSE
+  ),
+  `25-26` = c(
+    TRUE, TRUE, TRUE, TRUE, TRUE,
+    TRUE, TRUE, TRUE, TRUE,
+    TRUE, TRUE, TRUE
+  )
+)
+
+import_season <- function(season, schools) {
+  active_schools <- schools %>% filter(.data[[season]]) %>% pull(School)
+  boxscores_list <- map(active_schools, function(school) {
+    path <- str_glue("../data/boxscores/{school}_20{season}.csv")
+    df <- read_csv(path, show_col_types = FALSE)
+    message(str_glue('Season {season} for "{school}" imported.'))
+    df
+  })
+  bind_rows(boxscores_list)
+}
+
+boxscores_24 <- import_season("23-24", schools)
+boxscores_25 <- import_season("24-25", schools)
+boxscores_26 <- import_season("25-26", schools)
+
+awards_24 <- read_csv("../data/awards/conferenceusa_awards_2023-24.csv", show_col_types = FALSE)
+awards_25 <- read_csv("../data/awards/conferenceusa_awards_2024-25.csv", show_col_types = FALSE)
+awards_26 <- read_csv("../data/awards/conferenceusa_awards_2025-26.csv", show_col_types = FALSE)
+```
+
+### Data Summary
+
+```{r}
+#| label: data-summary
+for (info in list(
+  list(df = boxscores_24, label = "24"),
+  list(df = boxscores_25, label = "25"),
+  list(df = boxscores_26, label = "26")
+)) {
+  cat(str_glue("---------- Boxscores '{info$label} ----------"), "\n")
+  cat(str_glue("Features:\t{ncol(info$df)}"), "\n")
+  cat(str_glue("Observations:\t{nrow(info$df)}"), "\n\n")
+}
+
+for (info in list(
+  list(df = awards_24, label = "24"),
+  list(df = awards_25, label = "25"),
+  list(df = awards_26, label = "26")
+)) {
+  cat(str_glue("---------- Awards '{info$label} ----------"), "\n")
+  cat(str_glue("Features:\t{ncol(info$df)}"), "\n")
+  cat(str_glue("Observations:\t{nrow(info$df)}"), "\n\n")
+}
+```
+
+# Data Wrangling / Transformation
+
+### Cleaning
+
+```{r}
+#| label: data-cleaning
+# Combine the seasons for EDA and later transformations
+# but must retain season for train/validate/test later
+boxscores_24 <- boxscores_24 %>% mutate(season = "2023-24")
+boxscores_25 <- boxscores_25 %>% mutate(season = "2024-25")
+boxscores_26 <- boxscores_26 %>% mutate(season = "2025-26")
+
+boxscores <- bind_rows(boxscores_24, boxscores_25, boxscores_26)
+print("Boxscores")
+cat(str_glue("Features:\t{ncol(boxscores)}"), "\n")
+cat(str_glue("Observations:\t{nrow(boxscores)}"), "\n")
+
+awards <- bind_rows(awards_24, awards_25, awards_26) %>%
+  rename(season = `Year Won`)
+
+print("Awards")
+cat(str_glue("Features:\t{ncol(awards)}"), "\n")
+cat(str_glue("Observations:\t{nrow(awards)}"), "\n")
+```
+
+### Feature Engineering
+
+### Check Duplicates
+
+```{r}
+#| label: feature-engineering
+check_duplicates <- function(df) {
+  dupes <- duplicated(df)
+  n <- sum(dupes)
+  if (n > 0) {
+    cat(str_glue("{n} duplicated rows found"), "\n")
+  } else {
+    cat("No duplicated rows found\n")
+  }
+  df[dupes, ]
+}
+print("Boxscore duplicate check:")
+check_duplicates(boxscores)
+print("Award duplicate check:")
+check_duplicates(awards)
+```
+
+### Remove Coach Awards
+
+```{r}
+cat("Before removing coach awards\n")
+cat(str_glue("Features:\t{ncol(awards)}"), "\n")
+cat(str_glue("Observations:\t{nrow(awards)}"), "\n\n")
+
+awards <- awards %>%
+  filter(!str_detect(`Award Name`, regex("coach", ignore_case = TRUE)))
+
+cat("After removing coach awards\n")
+cat(str_glue("Features:\t{ncol(awards)}"), "\n")
+cat(str_glue("Observations:\t{nrow(awards)}"), "\n")
+```
+
+### Normalize Player Names
+
+```{r}
+normalize <- function(name) {
+  m <- str_match(name, "^\\s*([A-Za-z])[A-Za-z''.-]*\\s+([A-Za-z-]+)")
+  if (is.na(m[1, 1])) {
+    message(str_glue("Unable to handle {name}"))
+    return(NA_character_)
+  }
+  str_to_lower(str_c(m[1, 2], m[1, 3]))
+}
+
+award_players <- unique(awards$`Player Name`)
+awards_players_normal <- character()
+cat("Name Conflicts for Awards (like a jr and sr):\n")
+for (name in award_players) {
+  norm <- normalize(name)
+  if (norm %in% awards_players_normal) {
+    cat(str_glue("Conflict with {name}"), "\n")
+  } else {
+    awards_players_normal <- c(awards_players_normal, norm)
+  }
+}
+
+boxscore_players <- unique(boxscores$player)
+boxscore_players_normal <- character()
+cat("Name Conflicts for Boxscores (like a jr and sr):\n")
+for (name in boxscore_players) {
+  norm <- normalize(name)
+  if (norm %in% boxscore_players_normal) {
+    cat(str_glue("Conflict with {name}"), "\n")
+  } else {
+    boxscore_players_normal <- c(boxscore_players_normal, norm)
+  }
+}
+```
+
+```{r}
+missing_in_boxscores <- setdiff(awards_players_normal, boxscore_players_normal)
+for (name in missing_in_boxscores) {
+  cat(str_glue("Award name '{name}' not found in boxscores"), "\n")
+}
+```
+
+```{r}
+boxscores <- boxscores %>%
+  mutate(player = if_else(player == "Z. Powell", "Y. Powell", player))
+```
+
+```{r}
+normalize_col <- function(x) {
+  map_chr(x, normalize)
+}
+
+awards <- awards %>% mutate(pname = normalize_col(`Player Name`))
+boxscores <- boxscores %>% mutate(pname = normalize_col(player))
+```
+
+### Train/Test Split
+
+```{r}
+#| label: train-test-split
+
+train_boxscores <- boxscores %>% filter(season %in% c("2023-24", "2024-25"))
+test_boxscores  <- boxscores %>% filter(season == "2025-26")
+
+cat("boxscores shape:", nrow(boxscores), "x", ncol(boxscores), "\n")
+cat("train_boxscores shape:", nrow(train_boxscores), "x", ncol(train_boxscores), "\n")
+cat("test_boxscores shape:", nrow(test_boxscores), "x", ncol(test_boxscores), "\n")
+
+train_awards <- awards %>% filter(season %in% c("2023-24", "2024-25"))
+test_awards  <- awards %>% filter(season == "2025-26")
+
+cat("awards shape:", nrow(awards), "x", ncol(awards), "\n")
+cat("train_awards shape:", nrow(train_awards), "x", ncol(train_awards), "\n")
+cat("test_awards shape:", nrow(test_awards), "x", ncol(test_awards), "\n")
+```
+
+### Aggregate by Player-Season
+
+```{r}
+aggregate_player_season <- function(df) {
+  # Helper to get the mode (most frequent value)
+  stat_mode <- function(x) {
+    ux <- unique(x)
+    ux[which.max(tabulate(match(x, ux)))]
+  }
+
+  aggr <- df %>%
+    group_by(pname, season) %>%
+    summarise(
+      min_total       = sum(MIN),
+      min_pg          = mean(MIN),
+      pts_pg          = mean(PTS),
+      fg_made_pg      = mean(FGM),
+      fg_attempted_pg = mean(FGA),
+      tp_made_pg      = mean(`3PTM`),
+      tp_attempted_pg = mean(`3PTA`),
+      ft_made_pg      = mean(FTM),
+      ft_attempted_pg = mean(FTA),
+      ast_pg          = mean(AST),
+      tov_pg          = mean(TO),
+      stl_pg          = mean(STL),
+      blk_pg          = mean(BLK),
+      oreb_pg         = mean(OREB),
+      dreb_pg         = mean(DREB),
+      pf_pg           = mean(PF),
+      team            = stat_mode(team),
+      home_rate       = mean(home),
+      starter_rate    = mean(starter),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      fg_percentage_pg = if_else(fg_attempted_pg == 0, 0, fg_made_pg / fg_attempted_pg),
+      tp_percentage_pg = if_else(tp_attempted_pg == 0, 0, tp_made_pg / tp_attempted_pg),
+      ft_percentage_pg = if_else(ft_attempted_pg == 0, 0, ft_made_pg / ft_attempted_pg)
+    )
+
+  aggr
+}
+```
+
+```{r}
+train_player_season <- aggregate_player_season(train_boxscores)
+test_player_season <- aggregate_player_season(test_boxscores)
+cat("train_player_season shape:", nrow(train_player_season), "x", ncol(train_player_season), "\n")
+cat("test_player_season shape:", nrow(test_player_season), "x", ncol(test_player_season), "\n")
+```
+
+```{r}
+aggregate_awards <- function(df) {
+  df %>%
+    filter(`Award Name` != "Men's Conference USA All-Freshman Winners") %>%
+    group_by(pname, season) %>%
+    summarise(award_count = n(), .groups = "drop")
+}
+
+train_player_season_awards <- aggregate_awards(train_awards)
+cat("train awards shape:", nrow(train_player_season_awards), "x", ncol(train_player_season_awards), "\n")
+test_player_season_awards <- aggregate_awards(test_awards)
+cat("test awards shape:", nrow(test_player_season_awards), "x", ncol(test_player_season_awards), "\n")
+```
+
+### Merge Boxscores and Awards
+
+```{r}
+merge_boxscores_awards <- function(boxscores, awards) {
+  boxscores %>%
+    left_join(awards, by = c("pname", "season")) %>%
+    mutate(award_count = replace_na(award_count, 0))
+}
+train <- merge_boxscores_awards(train_player_season, train_player_season_awards)
+cat("train shape:", nrow(train), "x", ncol(train), "\n")
+test_full_season <- merge_boxscores_awards(test_player_season, test_player_season_awards)
+cat("test_full_season shape:", nrow(test_full_season), "x", ncol(test_full_season), "\n")
+```
+
+### Create Efficiency
+
+```{r}
+add_efficiency <- function(df) {
+  df %>%
+    mutate(
+      eff_pg = (pts_pg + dreb_pg + oreb_pg + ast_pg + stl_pg + blk_pg) -
+        ((fg_attempted_pg - fg_made_pg) + (ft_attempted_pg - ft_made_pg) + tov_pg)
+    )
+}
+
+train <- add_efficiency(train)
+test_full_season <- add_efficiency(test_full_season)
+```
+
+### Create Usage
+
+```{r}
+get_team_totals <- function(df) {
+  df %>%
+    group_by(team, season) %>%
+    summarise(
+      team_min_pg = sum(min_pg),
+      team_fga_pg = sum(fg_attempted_pg),
+      team_fta_pg = sum(ft_attempted_pg),
+      team_tov_pg = sum(tov_pg),
+      .groups = "drop"
+    )
+}
+
+add_usage <- function(df, team_totals) {
+  df %>%
+    left_join(team_totals, by = c("team", "season")) %>%
+    mutate(
+      player_poss = fg_attempted_pg + 0.44 * ft_attempted_pg + tov_pg,
+      team_poss   = team_fga_pg + 0.44 * team_fta_pg + team_tov_pg,
+      usg_pct     = 100 * (player_poss * (team_min_pg / 5)) / (min_pg * team_poss)
+    ) %>%
+    select(-player_poss, -team_poss)
+}
+
+train_team_totals <- get_team_totals(train)
+train <- add_usage(train, train_team_totals)
+
+test_team_totals <- get_team_totals(test_full_season)
+test_full_season <- add_usage(test_full_season, test_team_totals)
+```
+
+### Prepare X/y
+
+```{r}
+features <- c(
+  "dreb_pg",
+  "oreb_pg",
+  "ast_pg",
+  "stl_pg",
+  "blk_pg",
+  "fg_attempted_pg",
+  "fg_made_pg",
+  "ft_attempted_pg",
+  "ft_made_pg",
+  "tov_pg",
+  "team_fga_pg",
+  "team_fta_pg",
+  "team_tov_pg"
+)
+features_zero <- c("eff_pg")
+
+X_train <- train %>% select(all_of(features))
+
+# model cant handle two teams not playing in season 24 and 25 but in 26
+zero_team_cols <- X_train %>%
+  select(starts_with("team_")) %>%
+  select(where(~ sum(.) == 0)) %>%
+  names()
+cat("training:", zero_team_cols, "\n")
+X_train <- X_train %>% select(-any_of(zero_team_cols))
+
+X_test_full <- test_full_season %>%
+  select(all_of(features)) %>%
+  select(-any_of(zero_team_cols))
+
+y_train <- train$award_count
+y_test  <- test_full_season$award_count
+```
+
+### Export CSVs
+
+```{r}
+write_csv(X_train, "../data/traintest/X_train.csv")
+write_csv(X_test_full, "../data/traintest/X_test.csv")
+write_csv(tibble(award_count = y_train), "../data/traintest/y_train.csv")
+write_csv(tibble(award_count = y_test), "../data/traintest/y_test.csv")
+```
+
+# Data Visualization
+
+### Plot config
+
+```{r}
+#| warning: False
+# Combines train + test data for plots
+train_df <- cbind(y = y_train, X_train)
+test_df  <- cbind(y = y_test,  X_test_full)
+full_df <- bind_rows(train_df, test_df)
+
+# Generate Scatter Plots
+# Scatter plot predictors
+predictors <- c(
+  "dreb_pg", "oreb_pg", "ast_pg", "stl_pg", "blk_pg",
+  "fg_attempted_pg", "fg_made_pg",
+  "ft_attempted_pg", "ft_made_pg",
+  "tov_pg",
+  "team_fga_pg", "team_fta_pg", "team_tov_pg"
+)
+
+# Full labels for titles/axes
+Full_names <- c(
+  dreb_pg         = "Defensive Rebounds Per Game",
+  oreb_pg         = "Offensive Rebounds Per Game",
+  ast_pg          = "Assists Per Game",
+  stl_pg          = "Steals Per Game",
+  blk_pg          = "Blocks Per Game",
+  fg_attempted_pg = "Field Goal Attempts Per Game",
+  fg_made_pg      = "Field Goals Made Per Game",
+  ft_attempted_pg = "Free Throw Attempts Per Game",
+  ft_made_pg      = "Free Throws Made Per Game",
+  tov_pg          = "Turnovers Per Game",
+  team_fga_pg     = "Team Field Goal Attempts Per Game",
+  team_fta_pg     = "Team Free Throw Attempts Per Game",
+  team_tov_pg     = "Team Turnovers Per Game"
+)
+
+scatter_plots = list()
+# Scatter plots
+for (pred_var in predictors) {
+  
+  label_name <- Full_names[[pred_var]]
+  
+  pred_scatter <- ggplot(full_df, aes_string(x = pred_var, y = "y")) +
+    geom_point(color = "steelblue", alpha = 0.6, size = 2) +
+    geom_smooth(method = "lm", se = TRUE, color = "red", linewidth = 1) +
+    labs(
+      title = paste("Award Count vs", label_name),
+      x = label_name,
+      y = "Award Count"
+    ) +
+    theme_minimal(base_size = 14)
+  
+  scatter_plots[[pred_var]] <- pred_scatter
+}
+```
+
+### Figure 1
+
+```{r}
+#| label: fig-1
+#| warning: false
+scatter_plots$dreb_pg
+```
+
+Award count vs Defensive Rebounds Per Game: The regression line slopes upwards showing a positive relationship between the amount of awards won and defensive rebounds, with the higher the defensive rebounds a player has the higher chance of them having an award.
+
+### Figure 2
+
+```{r}
+#| label: fig-2
+#| warning: false
+scatter_plots$oreb_pg
+```
+
+Award count vs Offensive Rebounds Per Game: The regression line shows a positive relationship, with the higher the Offensive rebounds a player has the higher chance of them having an award.
+
+### Figure 3
+
+```{r}
+#| label: fig-3
+#| warning: false
+scatter_plots$ast_pg
+```
+
+Award count vs Assists Per Game: The regression line shows a positive relationship, with the higher the Assists per games a player has the higher chance of them having an award. Players with multiple awards have a moderate to high assist rate but assists alone do not guarantee awards.
+
+### Figure 4
+
+```{r}
+#| label: fig-4
+#| warning: false
+scatter_plots$stl_pg
+```
+
+Award count vs Steal Per Game: The regression line shows a positive relationship. The more steals a player has per game the better chance there is at winning an award but much like assists, steals alone does not guarantee more awards.
+
+### Figure 5
+
+```{r}
+#| label: fig-5
+#| warning: false
+scatter_plots$blk_pg
+```
+
+Award Count vs Blocks Per Game: The regression line shows a positive relationship. Blocks alone do not determine award success, but there is a higher chance of getting an award if you have more blocks.
+
+### Figure 6
+
+```{r}
+#| label: fig-6
+#| warning: false
+scatter_plots$fg_attempted_pg
+```
+
+Award Count vs Field Goal Attempts Per Game: The regression line shows a positive relationship. Players who take more shots tend to have more awards but just because you take more shots does not guarantee that you will win more awards.
+
+### Figure 7
+
+```{r}
+#| label: fig-7
+#| warning: false
+scatter_plots$fg_made_pg
+```
+
+Award Count vs Field Goals Made Per Game: The regression line shows a positive relationship. Players who make more more shots tend to have more awards.
+
+### Figure 8
+
+```{r}
+#| label: fig-8
+#| warning: false
+scatter_plots$ft_attempted_pg
+```
+
+Award Count vs Free Throw Attempts Per Game: The regression line shows a positive relationship. The more Free throw attempts per game a player has the higher the chance of them having awards. this most likely coincides with shot attempts because if you are shooting more during a game, there is a higher chance of you getting fouled more.
+
+### Figure 9
+
+```{r}
+#| label: fig-9
+#| warning: false
+scatter_plots$ft_made_pg
+```
+
+Award Count vs Free Throws Made Per Game: The regression line shows a positive relationship. Getting to the free throw line and making more free throws is associated with winning more awards likely because it reflects scoring ability which is highly associated with awards won.
+
+### Figure 10
+
+```{r}
+#| label: fig-10
+#| warning: false
+scatter_plots$tov_pg
+```
+
+Award Count vs Turnovers Per Game: The regression line shows a positive relationship. This shows that having more turnovers per game is highly associated to having more awards. This does not mean turnovers cause awards. higher award players often handle the ball more, create offense, and play larger roles, which naturally can lead to more turnovers.
+
+### Figure 11
+
+```{r}
+#| label: fig-11
+#| warning: false
+scatter_plots$team_fga_pg
+```
+
+Award Count vs Team Field Goal Attempts Per Game: The regression line has a slight downward slope, indicating little to no relationship between team shot volume and award count. There is no clear clustering of higher awards only at high or low team attempt values. How many shots a team takes per game does not appear to strongly influence individual award outcomes.
+
+### Figure 12
+
+```{r}
+#| label: fig-12
+#| warning: false
+scatter_plots$team_fta_pg
+```
+
+Award Count vs Team Free Throw Attempts Per Game: The regression line has a slight downward slope, indicating little to no relationship between team free throw attempt volume and award count. Overall team free throw attempt totals do not appear to strongly influence individual award success.
+
+### Figure 13
+
+```{r}
+#| label: fig-13
+#| warning: false
+scatter_plots$team_tov_pg
+```
+
+Award Count vs Team Turnovers Per Game: The regression line has a slight downward slope, indicating little to no relationship between team turnovers and award count. Overall team turnover totals do not appear to strongly determine individual award outcomes.
+
+## Interactive Figures
+
+### Interactive Figure 1
+
+```{r}
+#| label: interactive-fig-1
+p_h <- ggplot(full_df, aes(x = y)) +
+  geom_histogram(
+    binwidth = 1,
+    fill = "steelblue",
+    color = "black",
+    alpha = 0.8
+  ) +
+  scale_x_continuous(breaks = seq(min(full_df$y), max(full_df$y), by = 1)) +
+  labs(
+    title = "Distribution of Award Counts",
+    x = "Award Count",
+    y = "Frequency"
+  ) +
+  theme_minimal(base_size = 14)
+
+ggplotly(p_h)
+```
+
+This histogram shows the distribution of our data set, showing that there are excessive zeros which is why for further research we will pursue a zero inflated poisson model.
+
+### Interactive Figure 2
+
+```{r}
+#| label: interactive-fig-2
+#| warning: False
+
+p1 <- ggplot(train, aes(x = fg_made_pg, y = award_count, color=pname)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, color = "red", linewidth = 1) +
+  labs(
+    title = paste("Award Count vs Field Goals Made Per Game"),
+    x = "Field Goals Made Per Game",
+    y = "Award Count"
+    ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+ggplotly(p1, tooltip = c("pname"))
+```
+
+This interactive scatter-plot can be used to view the player that is associated with each data point.
+
+## Interactive Tables
+
+```{r}
+#| label: interactive-table
+
+num_cols <- names(train)[sapply(train, is.numeric)]
+
+datatable(train) |>
+  formatRound(columns = num_cols, digits = 2)
+```
+
+# Conclusion
+
+Overall, because of how basketball statistics are generally counts of positive events, then each individual predictor has a positive linear relationship with the response variable.
+
+In contrast, the three team based predictors had slightly negative to no correlation with the response variable.
+
+However, a single predictor or variable does not determine whether a player won an award or not, it is a combination of multiple predictors or variables that determine awards won and how many awards are won.
+
+As a follow up to this exploration, we plan on modeling the interactions with a Zero Poisson Inflation Model.
+
+------------------------------------------------------------------------
+
+## Team Members
+
+-   Kyle Bresko (kbresko\@students.kennesaw.edu)
+
+-   Charles Lane (clane30\@students.keensaw.edu)
+
+-   Kaleb Treangen (ktreang1\@students.kennesaw.edu)
+
+```{r}
+#| label: ksu-map
+# KSU coordinates: 34.0382, -84.5819
+leaflet() %>%
+  addTiles() %>%
+  setView(lng = -84.5819, lat = 34.0382, zoom = 15) %>%
+  addMarkers(
+    lng = -84.5819, lat = 34.0382,
+    popup = "Kyle Bresko (kbresko@students.kennesaw.edu)<br>
+    Charles Lane (clane30@students.keensaw.edu)<br>
+    Kaleb Treangen (ktreang1@students.kennesaw.edu)"
+  )
+```
+
+```{r}
+#| message: false
+#| warning: false
+#| dev: null
+qr <- qr_code("https://rpubs.com/charlestl/r_project_ncaa_awards")
+png(file="../assets/qr_code.png")
+plot(qr)
+dev.off()
+```
+
+```{r}
+plot(qr)
+```
