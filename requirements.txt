@@ -1,0 +1,20 @@
+# Jupyter execution environment
+jupyter
+nbformat
+nbclient
+
+# Core scientific stack
+numpy
+pandas
+matplotlib
+seaborn
+scipy
+
+# Machine learning
+scikit-learn
+
+# Statistical modeling
+statsmodels
+
+# Text label adjustment for plots
+adjustText
