@@ -25,7 +25,7 @@ jobs:
 
       # Install R dependencies (if you have an R package list)
       - name: Install R packages
-        run: Rscript -e 'install.packages(c("tidyverse","ggplot2","plotly","DT","leaflet","qrcode"), repos = "https://cloud.r-project.org")'
+        run: Rscript -e 'options(repos = c(CRAN = "https://packagemanager.posit.co/cran/__linux__/jammy/latest")); install.packages(c("tidyverse","ggplot2","plotly","DT","leaflet","qrcode"), repos = "https://cloud.r-project.org")'
 
       # Install Python
       - name: Setup Python
