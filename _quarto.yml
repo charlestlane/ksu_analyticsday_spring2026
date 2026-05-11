@@ -1,0 +1,4 @@
+project:
+  type: website
+  render:
+    - DATA4990.Bresko.Lane.Treangen.Analysis.ipynb
